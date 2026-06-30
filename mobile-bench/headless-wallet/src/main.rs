@@ -49,11 +49,21 @@
 //!                              Transfers native NIGHT, returns
 //!                              `{ "txHash": "<hex>" }`.
 //!
-//! Identity (deferred — `bootstrap` lands first, login / issuance
-//! arrive in a follow-up wave):
-//!   - `login`              — TBD
-//!   - `requestCredential`  — TBD
-//!   - `verify`             — TBD
+//! Identity (mirror the dioxus + service-layer flows):
+//!   - `login`             — `args: { "holderDid": "did:midnight:...",
+//!                                    "qrUrl": "openid4vp://..." }`.
+//!                           Returns `{ "sessionId": ..., "status": ... }`.
+//!   - `requestCredential` — `args: { "holderDid": "did:midnight:...",
+//!                                    "qrUrl": "openid4vci://..." }`.
+//!                           Returns `{ "vcUri": "..." }`.
+//!   - `verify`            — `args: { "vcUri": "..." }`. Returns
+//!                           `{ "result": "valid"|"invalid"|"error", ... }`.
+//!
+//! Maintenance:
+//!   - `forceSync`         — no args, no return data. Re-runs the wallet's
+//!                           unshielded UTXO + DUST sync. Useful between
+//!                           write verbs to refresh on-chain state inside a
+//!                           single binary spawn (backlog #10).
 
 use std::path::PathBuf;
 
@@ -63,7 +73,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value as Json;
 use tokio::io::{AsyncBufReadExt as _, BufReader};
 use wallet_core::headless::{HeadlessConfig, HeadlessWallet};
-use wallet_core::{Network, VaultLockPolicy};
+use wallet_core::vc_self_verify::SelfVerifyResult;
+use wallet_core::{DidId, Network, VaultLockPolicy};
 
 #[derive(Parser, Debug)]
 #[command(version, about, long_about = None)]
@@ -305,7 +316,85 @@ async fn handle_verb(wallet: &HeadlessWallet, verb: &str, args: Json) -> Respons
             }
         }
 
+        "login" => {
+            let holder = match parse_holder_did(&args) {
+                Ok(d) => d,
+                Err(e) => return err(verb, "bad-args", e),
+            };
+            let qr_url = match args.get("qrUrl").and_then(|v| v.as_str()) {
+                Some(s) if !s.is_empty() => s,
+                _ => return err(verb, "bad-args", "missing qrUrl"),
+            };
+            match wallet.login(holder, qr_url).await {
+                Ok(r) => ok(
+                    verb,
+                    serde_json::json!({
+                        "sessionId": r.session_id,
+                        "status": r.status,
+                    }),
+                ),
+                Err(e) => err(verb, "login-failed", e.to_string()),
+            }
+        }
+
+        "requestCredential" => {
+            let holder = match parse_holder_did(&args) {
+                Ok(d) => d,
+                Err(e) => return err(verb, "bad-args", e),
+            };
+            let qr_url = match args.get("qrUrl").and_then(|v| v.as_str()) {
+                Some(s) if !s.is_empty() => s,
+                _ => return err(verb, "bad-args", "missing qrUrl"),
+            };
+            match wallet.request_credential(holder, qr_url).await {
+                Ok(vc_uri) => ok(verb, serde_json::json!({ "vcUri": vc_uri })),
+                Err(e) => err(verb, "request-credential-failed", e.to_string()),
+            }
+        }
+
+        "verify" => {
+            let vc_uri = match args.get("vcUri").and_then(|v| v.as_str()) {
+                Some(s) if !s.is_empty() => s,
+                _ => return err(verb, "bad-args", "missing vcUri"),
+            };
+            match wallet.verify(vc_uri).await {
+                Ok(result) => ok(verb, self_verify_to_json(&result)),
+                Err(e) => err(verb, "verify-failed", e.to_string()),
+            }
+        }
+
+        "forceSync" => match wallet.force_sync().await {
+            Ok(()) => ok(verb, serde_json::json!({})),
+            Err(e) => err(verb, "sync-failed", e.to_string()),
+        },
+
         other => err(verb, "unknown-verb", format!("unsupported verb: {other}")),
+    }
+}
+
+fn parse_holder_did(args: &Json) -> Result<DidId, String> {
+    let did_str = args
+        .get("holderDid")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| "missing holderDid".to_string())?;
+    DidId::parse(did_str).map_err(|e| format!("invalid holderDid '{did_str}': {e}"))
+}
+
+fn self_verify_to_json(result: &SelfVerifyResult) -> Json {
+    match result {
+        SelfVerifyResult::Valid { vm_id } => serde_json::json!({
+            "result": "valid",
+            "vmId": vm_id,
+        }),
+        SelfVerifyResult::Invalid(reason) => serde_json::json!({
+            "result": "invalid",
+            "reason": format!("{reason:?}"),
+        }),
+        SelfVerifyResult::Error(msg) => serde_json::json!({
+            "result": "error",
+            "message": msg,
+        }),
     }
 }
 

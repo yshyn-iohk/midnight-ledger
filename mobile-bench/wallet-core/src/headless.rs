@@ -294,6 +294,26 @@ impl HeadlessWallet {
         self.network
     }
 
+    /// Re-sync the wallet's on-chain state — unshielded UTXO set + DUST
+    /// generators — so subsequent verbs in the same binary spawn see the
+    /// effects of writes done earlier in the same session.
+    ///
+    /// Without this, a chain of write verbs would re-balance against the
+    /// pre-write UtxoSet, picking the same coin inputs and tripping
+    /// `RpcError 1010 Custom error 196` (already-spent). The dispatcher
+    /// exposes this as the `forceSync` verb (backlog #10).
+    pub async fn force_sync(&self) -> Result<(), HeadlessError> {
+        self.wallet
+            .sync_unshielded()
+            .await
+            .map_err(|e| HeadlessError::Vault(format!("sync unshielded: {e}")))?;
+        self.wallet
+            .sync_dust()
+            .await
+            .map_err(|e| HeadlessError::Vault(format!("sync dust: {e}")))?;
+        Ok(())
+    }
+
     /// Return the wallet's own unshielded NIGHT receive address (bech32m).
     /// Used by operator scripts that need to know where to send funds to
     /// THIS wallet — e.g. the orchestrator computes a deterministic admin
