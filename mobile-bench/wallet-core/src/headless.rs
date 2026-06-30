@@ -123,10 +123,23 @@ pub enum HeadlessError {
 /// later call passes back; the controller secret is what's used
 /// to drive write circuits (e.g. MaintenanceUpdate) against the
 /// same DID — round-trip it back via [`HeadlessWallet::remember_controller_secret`].
-#[derive(Debug)]
+///
+/// `Debug` is hand-rolled (not derived) so the 32-byte controller
+/// secret is never leaked into `tracing::debug!`, panic messages,
+/// or other diagnostic output. Code that needs the bytes must read
+/// `.controller_sk` explicitly.
 pub struct BootstrapOutcome {
     pub did: DidId,
     pub controller_sk: [u8; 32],
+}
+
+impl std::fmt::Debug for BootstrapOutcome {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BootstrapOutcome")
+            .field("did", &self.did)
+            .field("controller_sk", &"<32-byte secret redacted>")
+            .finish()
+    }
 }
 
 impl From<BootstrappedDid> for BootstrapOutcome {

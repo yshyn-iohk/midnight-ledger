@@ -186,13 +186,77 @@ fn json_as_u8(v: &Json) -> Option<u8> {
     json_as_u64(v).and_then(|u| u8::try_from(u).ok())
 }
 
-fn text_to_bytes32(args: &Json, key: &str) -> [u8; 32] {
-    let s = args.get(key).and_then(|v| v.as_str()).unwrap_or("");
+/// Decode a JSON string field into a fixed 32-byte policy value.
+///
+/// Returns:
+///   - `Ok(None)`  — the field is missing or an empty string. Callers
+///                   that hold a `require_*` flag set to `true` MUST
+///                   treat this as an error; callers that don't require
+///                   the field can substitute `[0u8; 32]`.
+///   - `Ok(Some(b))` — non-empty decode. Prefers hex if the input is
+///                   exactly 64 hex characters (optionally `0x`-prefixed);
+///                   otherwise UTF-8 → bytes32, right-padded with zeros
+///                   (and a `tracing::warn!` if truncated past 32 bytes).
+///   - `Err(_)`    — hex-looking but malformed.
+///
+/// This replaces the old silent zero-pad / silent truncate behavior
+/// which could store an all-zero policy field that no holder could
+/// satisfy (caught in review 2026-07-01).
+fn decode_policy_text32(args: &Json, key: &str) -> anyhow::Result<Option<[u8; 32]>> {
+    let s = match args.get(key).and_then(|v| v.as_str()) {
+        Some(s) if !s.is_empty() => s,
+        _ => return Ok(None),
+    };
+    let stripped = s.trim_start_matches("0x");
+    // Heuristic: exactly 64 hex chars → treat as hex32.
+    if stripped.len() == 64 && stripped.chars().all(|c| c.is_ascii_hexdigit()) {
+        let bytes = hex::decode(stripped)
+            .with_context(|| format!("{key}: looked like hex32 but failed to decode"))?;
+        let arr: [u8; 32] = bytes
+            .try_into()
+            .map_err(|v: Vec<u8>| anyhow::anyhow!("{key}: expected 32 bytes, got {}", v.len()))?;
+        return Ok(Some(arr));
+    }
+    // UTF-8 fallback. Right-pad zeros; warn loudly on truncation since
+    // a silent truncate would let two distinct strings collide in the
+    // on-chain policy.
     let bytes = s.as_bytes();
+    if bytes.len() > 32 {
+        tracing::warn!(
+            field = key,
+            len = bytes.len(),
+            "policy text exceeds 32 bytes; truncating — distinct strings may collide on-chain"
+        );
+    }
     let mut out = [0u8; 32];
     let n = bytes.len().min(32);
     out[..n].copy_from_slice(&bytes[..n]);
-    out
+    Ok(Some(out))
+}
+
+/// Resolve a policy text field against its `require_*` flag.
+///
+/// When `required` is true the field MUST decode to a non-empty,
+/// non-all-zero value or we return an error — the lock would
+/// otherwise carry a zero policy byte no holder can satisfy.
+fn resolve_required_text32(
+    args: &Json,
+    key: &str,
+    required: bool,
+) -> anyhow::Result<[u8; 32]> {
+    let decoded = decode_policy_text32(args, key)?;
+    match (required, decoded) {
+        (false, Some(b)) => Ok(b),
+        (false, None) => Ok([0u8; 32]),
+        (true, Some(b)) if b != [0u8; 32] => Ok(b),
+        (true, Some(_)) => Err(anyhow::anyhow!(
+            "{key}: decoded to all-zero bytes but the matching require_* \
+             flag is set; the lock would be un-claimable"
+        )),
+        (true, None) => Err(anyhow::anyhow!(
+            "{key}: missing or empty but the matching require_* flag is set"
+        )),
+    }
 }
 
 async fn handle_verb(wallet: &HeadlessWallet, verb: &str, args: Json) -> Response {
@@ -411,12 +475,20 @@ async fn handle_create_lock(wallet: &HeadlessWallet, verb: &str, args: Json) -> 
         .get("requireIssuingState")
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
-    let issuing_state = text_to_bytes32(&args, "issuingState");
+    let issuing_state =
+        match resolve_required_text32(&args, "issuingState", require_issuing_state) {
+            Ok(b) => b,
+            Err(e) => return err(verb, "bad-args", e.to_string()),
+        };
     let require_document_number = args
         .get("requireDocumentNumber")
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
-    let document_number = text_to_bytes32(&args, "documentNumber");
+    let document_number =
+        match resolve_required_text32(&args, "documentNumber", require_document_number) {
+            Ok(b) => b,
+            Err(e) => return err(verb, "bad-args", e.to_string()),
+        };
     let max_claim = match args.get("maxClaimBaseUnits").and_then(json_as_u128) {
         Some(v) => v,
         None => return err(verb, "bad-args", "missing/invalid maxClaimBaseUnits"),
