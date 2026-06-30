@@ -453,7 +453,11 @@ const methods = {
       import(
         "@input-output-hk/passport-vault-contract/managed/passport-vault/contract/index.js"
       ),
-      import("@input-output-hk/passport-vault-contract/witnesses.js"),
+      // Use the package's declared `./witnesses` subpath (NOT `./witnesses.js`)
+      // — the vault contract's package.json `exports` map names it without
+      // the `.js` suffix, and node's strict ESM resolution rejects the
+      // suffix as ERR_PACKAGE_PATH_NOT_EXPORTED.
+      import("@input-output-hk/passport-vault-contract/witnesses"),
       import("@midnight-ntwrk/compact-runtime"),
       import("@midnight-ntwrk/midnight-js-contracts"),
       import("@midnight-ntwrk/ledger-v8"),
