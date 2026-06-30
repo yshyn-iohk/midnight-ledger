@@ -11,13 +11,13 @@ pub enum Network {
     Preview,
     QaNet,
     DevNet,
-    /// Localhost standalone — `http://localhost:1{8088,9944,6300}`.
+    /// Localhost standalone — `http://localhost:{8088,9944,6300}`.
     /// Matches gsd-wallet's "Undeployed" preset and is the default
     /// for any developer running the docker-compose standalone
     /// alongside the simulator (no env-var setup required).
     Undeployed,
     /// Same standalone chain as [`Network::Undeployed`], but reached
-    /// over Yurii's tailnet (`100.110.241.102:1{8088,9944,6300}`).
+    /// over Yurii's tailnet (`100.110.241.102:{8088,9944,6300}`).
     /// Lets the phone APK target the laptop's docker-hosted standalone
     /// without changing build flags. `network_id`, address prefix and
     /// the pre-funded genesis seed are identical to `Undeployed` —
@@ -157,24 +157,26 @@ impl Network {
                 dapp_url: "https://passport-vault.devnet.midnight.network",
             },
             Network::Undeployed => NetworkConfig {
-                // Standalone Midnight env, host-port-shifted by +10000
-                // (2026-05-27) to evade collision with a parallel
-                // midnight task that occupies the default 9944 / 8088
-                // / 6300 set. The docker-compose macOS overlay at
-                // `/tmp/midnight-standalone/docker-compose.macos.yml`
-                // does the host→container remap.
+                // Standalone Midnight env on the canonical ports
+                // (9944 / 8088 / 6300). An earlier revision port-shifted
+                // these by +10000 to coexist with a parallel midnight
+                // stack squatting the defaults — that was a workaround
+                // that broke the cli's bundled `standalone` profile (in
+                // `@midnight-ntwrk/midnight-did-api`) which hardcodes
+                // the canonical port and ignores shifts. The reproducible
+                // setup is "one chain stack on default ports"; operators
+                // running parallel stacks must stop the others first.
                 //
                 // Strict localhost — no env-var override. Pick this
                 // variant when the wallet runs alongside the docker
                 // env on the same host (desktop dev, simulator, etc.).
                 // For reaching the chain from another device, use
-                // [`Network::UndeployedYurii`] (tailscale) or add a
-                // sibling variant with your own endpoints.
+                // [`Network::UndeployedYurii`] (tailscale).
                 network_id: "undeployed",
-                indexer_http_url: "http://localhost:18088/api/v4/graphql",
-                indexer_ws_url: "ws://localhost:18088/api/v4/graphql/ws",
-                node_ws_url: "ws://localhost:19944",
-                proving_server_url: "http://localhost:16300",
+                indexer_http_url: "http://localhost:8088/api/v4/graphql",
+                indexer_ws_url: "ws://localhost:8088/api/v4/graphql/ws",
+                node_ws_url: "ws://localhost:9944",
+                proving_server_url: "http://localhost:6300",
                 dapp_url: "http://localhost:3000",
             },
             Network::UndeployedYurii => NetworkConfig {
@@ -183,17 +185,17 @@ impl Network {
                 // talk to the laptop-hosted docker chain without
                 // changing build flags. The tailscale IP is the
                 // laptop side (`yuriys-macbook-pro`,
-                // `100.110.241.102`). Ports stay shifted +10000.
+                // `100.110.241.102`). Canonical ports (no shifts).
                 //
                 // `network_id` matches `Undeployed` because it's the
                 // SAME chain — txs signed by either variant are
                 // accepted by the other, and the funded genesis seed
                 // applies to both. Only the URLs differ.
                 network_id: "undeployed",
-                indexer_http_url: "http://100.110.241.102:18088/api/v4/graphql",
-                indexer_ws_url: "ws://100.110.241.102:18088/api/v4/graphql/ws",
-                node_ws_url: "ws://100.110.241.102:19944",
-                proving_server_url: "http://100.110.241.102:16300",
+                indexer_http_url: "http://100.110.241.102:8088/api/v4/graphql",
+                indexer_ws_url: "ws://100.110.241.102:8088/api/v4/graphql/ws",
+                node_ws_url: "ws://100.110.241.102:9944",
+                proving_server_url: "http://100.110.241.102:6300",
                 dapp_url: "http://100.110.241.102:3000",
             },
         }
