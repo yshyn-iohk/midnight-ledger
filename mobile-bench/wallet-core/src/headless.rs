@@ -327,6 +327,23 @@ impl HeadlessWallet {
         Ok(())
     }
 
+    /// Snapshot the wallet's on-chain NIGHT + DUST balances. Syncs both
+    /// generators first, so the values are as fresh as any full-sync
+    /// balance query gets. Returns atomic units (multiply by 10^-6 for
+    /// NIGHT, DUST is smaller-grained). Used by orchestrators that need
+    /// to know whether admin already has funding + dust before spending
+    /// another cold-start on funding + accrual waits.
+    pub async fn balance_snapshot(
+        &self,
+    ) -> Result<(u128, u128), HeadlessError> {
+        let snap = self
+            .wallet
+            .balance_snapshot()
+            .await
+            .map_err(|e| HeadlessError::Vault(format!("balance snapshot: {e}")))?;
+        Ok((snap.night_atomic, snap.dust_atomic))
+    }
+
     /// Return the wallet's own unshielded NIGHT receive address (bech32m).
     /// Used by operator scripts that need to know where to send funds to
     /// THIS wallet — e.g. the orchestrator computes a deterministic admin

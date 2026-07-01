@@ -364,6 +364,17 @@ async fn handle_verb(wallet: &HeadlessWallet, verb: &str, args: Json) -> Respons
             Err(e) => err(verb, "address-derivation-failed", e.to_string()),
         },
 
+        "balanceSnapshot" => match wallet.balance_snapshot().await {
+            Ok((night_atomic, dust_atomic)) => ok(
+                verb,
+                serde_json::json!({
+                    "nightAtomic": night_atomic.to_string(),
+                    "dustAtomic": dust_atomic.to_string(),
+                }),
+            ),
+            Err(e) => err(verb, "balance-snapshot-failed", e.to_string()),
+        },
+
         "sendUnshielded" => {
             let recipient = match args.get("recipientAddress").and_then(|v| v.as_str()) {
                 Some(s) if !s.is_empty() => s.to_string(),
