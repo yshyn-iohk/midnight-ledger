@@ -1,93 +1,571 @@
 //! Headless Midnight wallet — CLI driver for every flow the
-//! dioxus app exposes.  Talks line-delimited JSON on stdin /
+//! dioxus app exposes. Talks line-delimited JSON on stdin /
 //! stdout; one verb per service method per the hex-architecture
 //! design doc:
 //!
 //!   docs/superpowers/specs/2026-05-29-hexagonal-headless-wallet-design.md
 //!   §2.4 (verbs + sample session)
-//!   §2.5 (UI port adapter pattern — CliUiAdapter lives here)
 //!
-//! Wave A3 (this commit): binary skeleton.  Parses CLI flags and
-//! prints the parsed config to stderr, then exits.  No verbs
-//! dispatched yet — those land in wave E once wave C has
-//! migrated the use-case bodies into the service layer that the
-//! verbs would call.
+//! ## Protocol
+//!
+//!   Request:  `{"verb":"<name>","args":{…}}` (one per stdin line)
+//!   Success:  `{"type":"result","verb":"<name>","ok":true,"data":{…}}`
+//!   Error:    `{"type":"error","verb":"<name>","code":"<code>","message":"<text>"}`
+//!
+//! Tracing → stderr; JSON envelopes → stdout.
+//!
+//! ## Supported verbs (minimum-viable set)
+//!
+//! Lifecycle:
+//!   - `connect`        — no-op verb (returns active network); the
+//!                        wallet is already connected at startup
+//!                        from CLI flags.
+//!   - `bootstrap`      — bootstrap a fresh DID against the chain.
+//!                        `args: { "seedHex": "<64-char hex>" }`
+//!   - `quit` / EOF     — close the dispatcher and exit 0.
+//!
+//! Vault (mirror the dioxus connector verbs):
+//!   - `vaultTotalLocked`     — `args: { "contractAddress": "<hex>" }`
+//!   - `vaultListLocks`       — `args: { "contractAddress": "<hex>" }`
+//!   - `vaultListCredentials` — `args: {}`
+//!   - `vaultCreateLock`      — `args: { "contractAddress", "minAge",
+//!                              "requireIssuingState"?, "issuingState"?,
+//!                              "requireDocumentNumber"?,
+//!                              "documentNumber"?, "maxClaimBaseUnits",
+//!                              "verifierChallengeHex"?,
+//!                              "initialAmountBaseUnits"? }`
+//!   - `vaultDeposit`         — `args: { "contractAddress", "lockId",
+//!                              "amountBaseUnits" }`
+//!   - `vaultClaim`           — `args: { "contractAddress", "lockId",
+//!                              "amountBaseUnits", "bundle",
+//!                              "currentDay"? }`
+//!
+//! Operator (treasury / address-derivation primitives):
+//!   - `getUnshieldedAddress` — `args: {}`. Returns
+//!                              `{ "address": "<bech32m>" }` for the
+//!                              currently-connected wallet.
+//!   - `sendUnshielded`       — `args: { "recipientAddress": "<bech32m>",
+//!                              "amountBaseUnits": "<decimal>" }`.
+//!                              Transfers native NIGHT, returns
+//!                              `{ "txHash": "<hex>" }`.
+//!
+//! Identity (mirror the dioxus + service-layer flows):
+//!   - `login`             — `args: { "holderDid": "did:midnight:...",
+//!                                    "qrUrl": "openid4vp://..." }`.
+//!                           Returns `{ "sessionId": ..., "status": ... }`.
+//!   - `requestCredential` — `args: { "holderDid": "did:midnight:...",
+//!                                    "qrUrl": "openid4vci://..." }`.
+//!                           Returns `{ "vcUri": "..." }`.
+//!   - `verify`            — `args: { "vcUri": "..." }`. Returns
+//!                           `{ "result": "valid"|"invalid"|"error", ... }`.
+//!
+//! Maintenance:
+//!   - `forceSync`         — no args, no return data. Re-runs the wallet's
+//!                           unshielded UTXO + DUST sync. Useful between
+//!                           write verbs to refresh on-chain state inside a
+//!                           single binary spawn (backlog #10).
 
+use std::path::PathBuf;
+
+use anyhow::Context as _;
 use clap::Parser;
+use serde::{Deserialize, Serialize};
+use serde_json::Value as Json;
+use tokio::io::{AsyncBufReadExt as _, BufReader};
+use wallet_core::headless::{HeadlessConfig, HeadlessWallet};
+use wallet_core::vc_self_verify::SelfVerifyResult;
+use wallet_core::{DidId, Network, VaultLockPolicy};
 
-/// Headless Midnight wallet — drives every flow over a
-/// line-delimited JSON protocol.  See the design doc §2.4 for
-/// the protocol shape + verb list.
 #[derive(Parser, Debug)]
 #[command(version, about, long_about = None)]
 struct Cli {
-    /// Target chain: standalone (docker-compose), preprod, mainnet.
-    #[arg(long, default_value = "standalone")]
+    /// Target chain: undeployed (docker-compose, localhost),
+    /// undeployedyurii (tailnet), preprod, etc. Mirrors the dioxus
+    /// wallet's network names.
+    #[arg(long, default_value = "undeployed")]
     network: String,
 
-    /// On-disk redb path for the wallet store.  Mutually
-    /// exclusive with --in-memory-store.
-    #[arg(long)]
-    store_path: Option<std::path::PathBuf>,
+    /// 32-byte master seed as 64-char hex. Required: the wallet
+    /// has to connect against a real seed even before `bootstrap`.
+    /// The standalone chain pre-funds `0000…0001`
+    /// (UNDEPLOYED_GENESIS_SEED_HEX); arbitrary seeds get only
+    /// per-block emission.
+    #[arg(long, env = "HEADLESS_SEED_HEX")]
+    seed_hex: String,
 
-    /// Use an in-memory store (data lost at exit).  For tests +
-    /// quick local debug.
-    #[arg(long, conflicts_with = "store_path")]
-    in_memory_store: bool,
+    /// On-disk redb path for the VC store. Created on first use.
+    #[arg(long, default_value = "/tmp/headless-wallet-vcs.redb")]
+    vc_store_path: PathBuf,
 
-    /// Read the unlock passphrase from this env var.
-    #[arg(long, env = "HEADLESS_PASSPHRASE")]
-    passphrase_env: Option<String>,
+    /// Override the proof-server URL. `""` opts into the in-process
+    /// LocalProver (slow). Defaults to the network's configured
+    /// proof server.
+    #[arg(long, env = "MIDNIGHT_PROOF_SERVER_URL")]
+    proof_server_url: Option<String>,
+}
 
-    /// Read the unlock passphrase from stdin's first line.
-    #[arg(long, conflicts_with = "passphrase_env")]
-    passphrase_stdin: bool,
+#[derive(Deserialize)]
+struct Request {
+    verb: String,
+    #[serde(default)]
+    args: Json,
+}
 
-    /// Use this passphrase verbatim (test convenience — never
-    /// pass a real passphrase here on a shared host).
-    #[arg(long, conflicts_with_all = ["passphrase_env", "passphrase_stdin"])]
-    passphrase: Option<String>,
+#[derive(Serialize)]
+#[serde(tag = "type", rename_all = "lowercase")]
+enum Response {
+    Result {
+        verb: String,
+        ok: bool,
+        data: Json,
+    },
+    Error {
+        verb: String,
+        code: String,
+        message: String,
+    },
+}
 
-    /// Proof-server URL.  Omit to use the in-process LocalProver
-    /// (slow on debug builds).
-    #[arg(long)]
-    proof_server: Option<String>,
+fn parse_network(s: &str) -> anyhow::Result<Network> {
+    match s.to_ascii_lowercase().as_str() {
+        "undeployed" => Ok(Network::Undeployed),
+        "undeployedyurii" | "tailnet" | "undeployed-tailscale" => Ok(Network::UndeployedYurii),
+        "preprod" => Ok(Network::PreProd),
+        "preview" => Ok(Network::Preview),
+        "qanet" => Ok(Network::QaNet),
+        "devnet" => Ok(Network::DevNet),
+        "mainnet" => Ok(Network::Mainnet),
+        other => anyhow::bail!("unknown network: {other}"),
+    }
+}
 
-    /// Indexer HTTP URL.  Defaults per --network.
-    #[arg(long)]
-    indexer: Option<String>,
+fn decode_hex32(hex_str: &str, field: &str) -> anyhow::Result<[u8; 32]> {
+    let bytes = hex::decode(hex_str.trim_start_matches("0x"))
+        .with_context(|| format!("{field}: not hex"))?;
+    bytes
+        .try_into()
+        .map_err(|v: Vec<u8>| anyhow::anyhow!("{field}: expected 32 bytes, got {}", v.len()))
+}
 
-    /// Node WebSocket URL.  Defaults per --network.
-    #[arg(long)]
-    node: Option<String>,
+fn emit(resp: &Response) {
+    let line = serde_json::to_string(resp).expect("serialize Response");
+    println!("{line}");
+}
 
-    /// Replace HttpClient with a MockHttpClient driven from
-    /// `http-mock-push` sidecar commands on stdin.  For the
-    /// oid4vp / oid4vci integration tests.
-    #[arg(long)]
-    mock_http: bool,
+fn ok(verb: &str, data: Json) -> Response {
+    Response::Result {
+        verb: verb.to_string(),
+        ok: true,
+        data,
+    }
+}
 
-    /// Replace indexer / node / prover with stubs.  For
-    /// unit-style end-to-end runs without a live chain.
-    #[arg(long)]
-    mock_chain: bool,
+fn err(verb: &str, code: &str, message: impl Into<String>) -> Response {
+    Response::Error {
+        verb: verb.to_string(),
+        code: code.to_string(),
+        message: message.into(),
+    }
+}
 
-    /// Dump MetricsSnapshot JSON to this path at exit.
-    #[arg(long)]
-    metrics_out: Option<std::path::PathBuf>,
+fn json_as_u64(v: &Json) -> Option<u64> {
+    v.as_u64()
+        .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
+}
 
-    /// Interactive mode — prompt for input on stdin when
-    /// `UserInterface::prompt_text` is called.  Default
-    /// (non-interactive) takes prompt answers from the verb's
-    /// `args` map.
-    #[arg(long)]
-    interactive: bool,
+fn json_as_u128(v: &Json) -> Option<u128> {
+    // serde_json's Value::as_u128 doesn't exist; widen u64 and fall
+    // back to parsing a string-numeral (the dApp + CLI both ship
+    // amounts as decimal strings to survive the JSON bridge).
+    v.as_u64()
+        .map(u128::from)
+        .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
+}
+
+fn json_as_u8(v: &Json) -> Option<u8> {
+    json_as_u64(v).and_then(|u| u8::try_from(u).ok())
+}
+
+/// Decode a JSON string field into a fixed 32-byte policy value.
+///
+/// Returns:
+///   - `Ok(None)`  — the field is missing or an empty string. Callers
+///                   that hold a `require_*` flag set to `true` MUST
+///                   treat this as an error; callers that don't require
+///                   the field can substitute `[0u8; 32]`.
+///   - `Ok(Some(b))` — non-empty decode. Prefers hex if the input is
+///                   exactly 64 hex characters (optionally `0x`-prefixed);
+///                   otherwise UTF-8 → bytes32, right-padded with zeros
+///                   (and a `tracing::warn!` if truncated past 32 bytes).
+///   - `Err(_)`    — hex-looking but malformed.
+///
+/// This replaces the old silent zero-pad / silent truncate behavior
+/// which could store an all-zero policy field that no holder could
+/// satisfy (caught in review 2026-07-01).
+fn decode_policy_text32(args: &Json, key: &str) -> anyhow::Result<Option<[u8; 32]>> {
+    let s = match args.get(key).and_then(|v| v.as_str()) {
+        Some(s) if !s.is_empty() => s,
+        _ => return Ok(None),
+    };
+    let stripped = s.trim_start_matches("0x");
+    // Heuristic: exactly 64 hex chars → treat as hex32.
+    if stripped.len() == 64 && stripped.chars().all(|c| c.is_ascii_hexdigit()) {
+        let bytes = hex::decode(stripped)
+            .with_context(|| format!("{key}: looked like hex32 but failed to decode"))?;
+        let arr: [u8; 32] = bytes
+            .try_into()
+            .map_err(|v: Vec<u8>| anyhow::anyhow!("{key}: expected 32 bytes, got {}", v.len()))?;
+        return Ok(Some(arr));
+    }
+    // UTF-8 fallback. Right-pad zeros; warn loudly on truncation since
+    // a silent truncate would let two distinct strings collide in the
+    // on-chain policy.
+    let bytes = s.as_bytes();
+    if bytes.len() > 32 {
+        tracing::warn!(
+            field = key,
+            len = bytes.len(),
+            "policy text exceeds 32 bytes; truncating — distinct strings may collide on-chain"
+        );
+    }
+    let mut out = [0u8; 32];
+    let n = bytes.len().min(32);
+    out[..n].copy_from_slice(&bytes[..n]);
+    Ok(Some(out))
+}
+
+/// Resolve a policy text field against its `require_*` flag.
+///
+/// When `required` is true the field MUST decode to a non-empty,
+/// non-all-zero value or we return an error — the lock would
+/// otherwise carry a zero policy byte no holder can satisfy.
+fn resolve_required_text32(
+    args: &Json,
+    key: &str,
+    required: bool,
+) -> anyhow::Result<[u8; 32]> {
+    let decoded = decode_policy_text32(args, key)?;
+    match (required, decoded) {
+        (false, Some(b)) => Ok(b),
+        (false, None) => Ok([0u8; 32]),
+        (true, Some(b)) if b != [0u8; 32] => Ok(b),
+        (true, Some(_)) => Err(anyhow::anyhow!(
+            "{key}: decoded to all-zero bytes but the matching require_* \
+             flag is set; the lock would be un-claimable"
+        )),
+        (true, None) => Err(anyhow::anyhow!(
+            "{key}: missing or empty but the matching require_* flag is set"
+        )),
+    }
+}
+
+async fn handle_verb(wallet: &HeadlessWallet, verb: &str, args: Json) -> Response {
+    match verb {
+        "connect" => ok(
+            verb,
+            serde_json::json!({ "network": format!("{:?}", wallet.network()) }),
+        ),
+
+        "bootstrap" => {
+            let seed_hex = match args.get("seedHex").and_then(|v| v.as_str()) {
+                Some(s) => s,
+                None => return err(verb, "bad-args", "missing seedHex"),
+            };
+            let seed = match decode_hex32(seed_hex, "seedHex") {
+                Ok(b) => b,
+                Err(e) => return err(verb, "bad-args", e.to_string()),
+            };
+            match wallet.bootstrap(seed).await {
+                Ok(out) => ok(
+                    verb,
+                    serde_json::json!({
+                        "did": out.did.to_did_string(),
+                        "controllerSkHex": hex::encode(out.controller_sk),
+                    }),
+                ),
+                Err(e) => err(verb, "bootstrap-failed", e.to_string()),
+            }
+        }
+
+        "vaultTotalLocked" => match args.get("contractAddress").and_then(|v| v.as_str()) {
+            Some(addr) => match wallet.vault_total_locked(addr.to_string()).await {
+                Ok(total) => ok(
+                    verb,
+                    serde_json::json!({ "totalLockedBaseUnits": total.to_string() }),
+                ),
+                Err(e) => err(verb, "vault-read-failed", e.to_string()),
+            },
+            None => err(verb, "bad-args", "missing contractAddress"),
+        },
+
+        "vaultListLocks" => match args.get("contractAddress").and_then(|v| v.as_str()) {
+            Some(addr) => match wallet.vault_list_locks(addr.to_string()).await {
+                Ok(json) => ok(verb, json),
+                Err(e) => err(verb, "vault-read-failed", e.to_string()),
+            },
+            None => err(verb, "bad-args", "missing contractAddress"),
+        },
+
+        "vaultListCredentials" => match wallet.vault_list_credentials() {
+            Ok(creds) => ok(verb, serde_json::json!({ "credentials": creds })),
+            Err(e) => err(verb, "vc-store-error", e.to_string()),
+        },
+
+        "vaultCreateLock" => handle_create_lock(wallet, verb, args).await,
+
+        "vaultDeposit" => {
+            let addr = match args.get("contractAddress").and_then(|v| v.as_str()) {
+                Some(s) => s.to_string(),
+                None => return err(verb, "bad-args", "missing contractAddress"),
+            };
+            let lock_id = match args.get("lockId").and_then(json_as_u64) {
+                Some(v) => v,
+                None => return err(verb, "bad-args", "missing/invalid lockId"),
+            };
+            let amount = match args.get("amountBaseUnits").and_then(json_as_u128) {
+                Some(v) => v,
+                None => return err(verb, "bad-args", "missing/invalid amountBaseUnits"),
+            };
+            match wallet.vault_deposit(addr, lock_id, amount).await {
+                Ok(tx_hash) => ok(verb, serde_json::json!({ "txHash": tx_hash })),
+                Err(e) => err(verb, "vault-deposit-failed", e.to_string()),
+            }
+        }
+
+        "vaultClaim" => {
+            let addr = match args.get("contractAddress").and_then(|v| v.as_str()) {
+                Some(s) => s.to_string(),
+                None => return err(verb, "bad-args", "missing contractAddress"),
+            };
+            let lock_id = match args.get("lockId").and_then(json_as_u64) {
+                Some(v) => v,
+                None => return err(verb, "bad-args", "missing/invalid lockId"),
+            };
+            let amount = match args.get("amountBaseUnits").and_then(json_as_u128) {
+                Some(v) => v,
+                None => return err(verb, "bad-args", "missing/invalid amountBaseUnits"),
+            };
+            let bundle = match args.get("bundle") {
+                Some(b) if b.is_object() => b.clone(),
+                _ => return err(verb, "bad-args", "missing bundle object"),
+            };
+            let current_day = args.get("currentDay").and_then(json_as_u64);
+            match wallet
+                .vault_claim(addr, lock_id, amount, bundle, current_day)
+                .await
+            {
+                Ok(tx_hash) => ok(verb, serde_json::json!({ "txHash": tx_hash })),
+                Err(e) => err(verb, "vault-claim-failed", e.to_string()),
+            }
+        }
+
+        "getUnshieldedAddress" => match wallet.unshielded_address() {
+            Ok(addr) => ok(verb, serde_json::json!({ "address": addr })),
+            Err(e) => err(verb, "address-derivation-failed", e.to_string()),
+        },
+
+        "balanceSnapshot" => match wallet.balance_snapshot().await {
+            Ok((night_atomic, dust_atomic)) => ok(
+                verb,
+                serde_json::json!({
+                    "nightAtomic": night_atomic.to_string(),
+                    "dustAtomic": dust_atomic.to_string(),
+                }),
+            ),
+            Err(e) => err(verb, "balance-snapshot-failed", e.to_string()),
+        },
+
+        "sendUnshielded" => {
+            let recipient = match args.get("recipientAddress").and_then(|v| v.as_str()) {
+                Some(s) if !s.is_empty() => s.to_string(),
+                _ => return err(verb, "bad-args", "missing recipientAddress"),
+            };
+            let amount = match args.get("amountBaseUnits").and_then(json_as_u128) {
+                Some(v) if v > 0 => v,
+                Some(_) => return err(verb, "bad-args", "amountBaseUnits must be > 0"),
+                None => return err(verb, "bad-args", "missing/invalid amountBaseUnits"),
+            };
+            match wallet.send_unshielded(&recipient, amount).await {
+                Ok(tx_hash) => ok(verb, serde_json::json!({ "txHash": tx_hash })),
+                Err(e) => err(verb, "send-unshielded-failed", e.to_string()),
+            }
+        }
+
+        "login" => {
+            let holder = match parse_holder_did(&args) {
+                Ok(d) => d,
+                Err(e) => return err(verb, "bad-args", e),
+            };
+            let qr_url = match args.get("qrUrl").and_then(|v| v.as_str()) {
+                Some(s) if !s.is_empty() => s,
+                _ => return err(verb, "bad-args", "missing qrUrl"),
+            };
+            match wallet.login(holder, qr_url).await {
+                Ok(r) => ok(
+                    verb,
+                    serde_json::json!({
+                        "sessionId": r.session_id,
+                        "status": r.status,
+                    }),
+                ),
+                Err(e) => err(verb, "login-failed", e.to_string()),
+            }
+        }
+
+        "requestCredential" => {
+            let holder = match parse_holder_did(&args) {
+                Ok(d) => d,
+                Err(e) => return err(verb, "bad-args", e),
+            };
+            let qr_url = match args.get("qrUrl").and_then(|v| v.as_str()) {
+                Some(s) if !s.is_empty() => s,
+                _ => return err(verb, "bad-args", "missing qrUrl"),
+            };
+            match wallet.request_credential(holder, qr_url).await {
+                Ok(vc_uri) => ok(verb, serde_json::json!({ "vcUri": vc_uri })),
+                Err(e) => err(verb, "request-credential-failed", e.to_string()),
+            }
+        }
+
+        "verify" => {
+            let vc_uri = match args.get("vcUri").and_then(|v| v.as_str()) {
+                Some(s) if !s.is_empty() => s,
+                _ => return err(verb, "bad-args", "missing vcUri"),
+            };
+            match wallet.verify(vc_uri).await {
+                Ok(result) => ok(verb, self_verify_to_json(&result)),
+                Err(e) => err(verb, "verify-failed", e.to_string()),
+            }
+        }
+
+        "forceSync" => match wallet.force_sync().await {
+            Ok(()) => ok(verb, serde_json::json!({})),
+            Err(e) => err(verb, "sync-failed", e.to_string()),
+        },
+
+        other => err(verb, "unknown-verb", format!("unsupported verb: {other}")),
+    }
+}
+
+fn parse_holder_did(args: &Json) -> Result<DidId, String> {
+    let did_str = args
+        .get("holderDid")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| "missing holderDid".to_string())?;
+    DidId::parse(did_str).map_err(|e| format!("invalid holderDid '{did_str}': {e}"))
+}
+
+fn self_verify_to_json(result: &SelfVerifyResult) -> Json {
+    match result {
+        SelfVerifyResult::Valid { vm_id } => serde_json::json!({
+            "result": "valid",
+            "vmId": vm_id,
+        }),
+        SelfVerifyResult::Invalid(reason) => serde_json::json!({
+            "result": "invalid",
+            "reason": format!("{reason:?}"),
+        }),
+        SelfVerifyResult::Error(msg) => serde_json::json!({
+            "result": "error",
+            "message": msg,
+        }),
+    }
+}
+
+async fn handle_create_lock(wallet: &HeadlessWallet, verb: &str, args: Json) -> Response {
+    let addr = match args.get("contractAddress").and_then(|v| v.as_str()) {
+        Some(s) => s.to_string(),
+        None => return err(verb, "bad-args", "missing contractAddress"),
+    };
+    let min_age = match args.get("minAge").and_then(json_as_u8) {
+        Some(v) => v,
+        None => return err(verb, "bad-args", "missing/invalid minAge (0-255)"),
+    };
+    let require_issuing_state = args
+        .get("requireIssuingState")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let issuing_state =
+        match resolve_required_text32(&args, "issuingState", require_issuing_state) {
+            Ok(b) => b,
+            Err(e) => return err(verb, "bad-args", e.to_string()),
+        };
+    let require_document_number = args
+        .get("requireDocumentNumber")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let document_number =
+        match resolve_required_text32(&args, "documentNumber", require_document_number) {
+            Ok(b) => b,
+            Err(e) => return err(verb, "bad-args", e.to_string()),
+        };
+    let max_claim = match args.get("maxClaimBaseUnits").and_then(json_as_u128) {
+        Some(v) => v,
+        None => return err(verb, "bad-args", "missing/invalid maxClaimBaseUnits"),
+    };
+    // REQUIRED, NOT optional. The passport-vault contract asserts
+    // `verifierChallengeHash != zeros` in `createLock` (and the claim
+    // path matches it against the holder's bundle), so a lock created
+    // with the zero default is permanently un-claimable. Earlier version
+    // defaulted to zeros and silently produced stranded locks — caught
+    // 2026-06-30 with 3 NIGHT permanently locked in 2 stranded locks.
+    // The verifier challenge is the lock's verifier-side anchor; the
+    // caller MUST source it (e.g. hash of `VAULT_VERIFIER_CHALLENGE` env,
+    // or `bundle.verifierChallengeHashHex` if anchoring against a
+    // specific issued credential).
+    let challenge = match args.get("verifierChallengeHex").and_then(|v| v.as_str()) {
+        Some(h) if !h.is_empty() => match decode_hex32(h, "verifierChallengeHex") {
+            Ok(b) if b != [0u8; 32] => b,
+            Ok(_) => {
+                return err(
+                    verb,
+                    "bad-args",
+                    "verifierChallengeHex must be non-zero — vault contract \
+                     asserts it, locks with zero challenge are un-claimable",
+                );
+            }
+            Err(e) => return err(verb, "bad-args", e.to_string()),
+        },
+        _ => {
+            return err(
+                verb,
+                "bad-args",
+                "missing verifierChallengeHex — REQUIRED for createLock \
+                 (the vault contract asserts it non-zero; locks with zero \
+                 challenge cannot be claimed). Derive from \
+                 `VAULT_VERIFIER_CHALLENGE` env or the credential bundle's \
+                 `verifierChallengeHashHex`.",
+            );
+        }
+    };
+    let initial = args
+        .get("initialAmountBaseUnits")
+        .and_then(json_as_u128)
+        .unwrap_or(0);
+    let policy = VaultLockPolicy {
+        min_age,
+        require_issuing_state,
+        required_issuing_state: issuing_state,
+        require_document_number,
+        required_document_number: document_number,
+        max_claim,
+        verifier_challenge_hash: challenge,
+    };
+    match wallet.vault_create_lock(addr, policy, initial).await {
+        Ok(outcome) => ok(
+            verb,
+            serde_json::json!({
+                "txHash": outcome.tx_hash,
+                "lockId": outcome.lock_id.to_string(),
+            }),
+        ),
+        Err(e) => err(verb, "vault-create-lock-failed", e.to_string()),
+    }
 }
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    // Tracing to stderr so stdout stays clean for the
-    // line-delimited JSON protocol (wave E).
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
     tracing_subscriber::fmt()
@@ -96,15 +574,53 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let cli = Cli::parse();
-    tracing::info!(?cli, "headless-wallet wave-A3 skeleton — config parsed");
+    let network = parse_network(&cli.network)?;
+    let seed = decode_hex32(&cli.seed_hex, "--seed-hex")?;
 
-    // Wave E wires the service container + verb dispatcher
-    // here.  Skeleton just exits clean so we can ship the
-    // crate scaffolding now without the protocol surface.
-    eprintln!(
-        "headless-wallet skeleton: parsed config, exiting.\n\
-         The verb-dispatch loop lands in refactor wave E (per design doc §3)."
+    tracing::info!(
+        network = ?network,
+        vc_store = %cli.vc_store_path.display(),
+        "headless-wallet: connecting"
     );
 
+    let wallet = HeadlessWallet::connect(HeadlessConfig {
+        network,
+        seed,
+        vc_store_path: cli.vc_store_path.clone(),
+        proof_server_url: cli.proof_server_url.clone(),
+    })
+    .await
+    .context("connect HeadlessWallet")?;
+
+    // Initial banner so callers know we're ready (and what network).
+    emit(&ok(
+        "ready",
+        serde_json::json!({
+            "network": format!("{:?}", network),
+            "vcStorePath": cli.vc_store_path.display().to_string(),
+        }),
+    ));
+
+    let mut stdin = BufReader::new(tokio::io::stdin()).lines();
+    while let Some(line) = stdin.next_line().await? {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        if line == "quit" || line == "exit" {
+            break;
+        }
+        let req: Request = match serde_json::from_str(line) {
+            Ok(r) => r,
+            Err(e) => {
+                emit(&err("?", "parse-error", e.to_string()));
+                continue;
+            }
+        };
+        let resp = handle_verb(&wallet, &req.verb, req.args).await;
+        emit(&resp);
+    }
+
+    tracing::info!("headless-wallet: clean shutdown");
     Ok(())
 }

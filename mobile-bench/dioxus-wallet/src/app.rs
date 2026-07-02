@@ -883,16 +883,41 @@ fn attach_app_providers(base: Wallet, net: Network) -> Wallet {
     //      etc.). This is the Android path: switching the
     //      in-app network picker is enough to retarget the
     //      proof-server; no APK rebuild required.
-    let resolved_url: String = PROOF_SERVER_URL
-        .get()
-        .cloned()
-        .unwrap_or_else(|| net.config().proving_server_url.to_string());
-    tracing::info!(
-        target: "dioxuswalletmain",
-        proof_server_url = %resolved_url,
-        "app_wallet_for: attaching proof-server URL",
-    );
-    let with_url = base.with_proof_server_url(resolved_url);
+    //
+    // ANDROID: skip both resolution paths. Mobile builds prove
+    // in-process via wallet-core's `LocalProver` (per the
+    // `chain::default_prover(None)` fallback) — the wallet's
+    // build.rs syncs the per-circuit prover keys + zkir from
+    // upstream midnight-did + passport-vault into
+    // `wallet-core/contracts/`, and the LocalProver loads them
+    // by circuit name. This keeps the phone from depending on a
+    // remote proof-server (battery, latency, version-skew with
+    // the laptop-side docker proof-server). Desktop/iOS keep
+    // the URL path so `--features proof-server-http` (which
+    // spawns a host-local proof-server) still wins, and
+    // `Undeployed*` configs still drive a sensible default for
+    // dev workflows without proof-server-http enabled.
+    #[cfg(target_os = "android")]
+    let with_url = {
+        tracing::info!(
+            target: "dioxuswalletmain",
+            "app_wallet_for: Android — using in-process LocalProver (no proof-server URL attached)",
+        );
+        base
+    };
+    #[cfg(not(target_os = "android"))]
+    let with_url = {
+        let resolved_url: String = PROOF_SERVER_URL
+            .get()
+            .cloned()
+            .unwrap_or_else(|| net.config().proving_server_url.to_string());
+        tracing::info!(
+            target: "dioxuswalletmain",
+            proof_server_url = %resolved_url,
+            "app_wallet_for: attaching proof-server URL",
+        );
+        base.with_proof_server_url(resolved_url)
+    };
     // Layer 2 / Phase 3: attach the persisted DUST syncer if the
     // store has been opened. `Wallet::sync_dust` will then resume
     // from `last_id + 1` instead of replaying ~534k events on
@@ -987,34 +1012,104 @@ fn parse_seed_hex_env(var: &str) -> Option<[u8; 32]> {
 /// signal is created; the in-app network switcher can change it
 /// afterwards. Also the default network for vault verbs (see
 /// `bridge::vault_network`).
+/// Process-wide mirror of the runtime-selected network (the Wallet-tab
+/// picker's `network` signal). Initialized to [`startup_network`] on
+/// App boot; rewritten by the picker `onchange` handler whenever the
+/// user flips between variants (e.g. `Undeployed → Undeployed (Tailscale)`).
+///
+/// Bridge / FFI handlers that need the **current** network — without
+/// access to the Dioxus signal — should call [`current_network`]
+/// instead of [`startup_network`]. The two diverge as soon as the user
+/// touches the picker; reading the latter at request time would lock
+/// every connector reply (chain URLs, vault network, etc.) to whatever
+/// the binary started on, regardless of the picker.
+static CURRENT_NETWORK: std::sync::OnceLock<std::sync::RwLock<Network>> = std::sync::OnceLock::new();
+
+/// Returns the current runtime network (picker-selected, falls back to
+/// [`startup_network`] before the App has initialized the mirror).
+pub(crate) fn current_network() -> Network {
+    *CURRENT_NETWORK
+        .get_or_init(|| std::sync::RwLock::new(startup_network()))
+        .read()
+        .expect("CURRENT_NETWORK RwLock poisoned")
+}
+
+/// Updates the process-wide network mirror. Called once from the App
+/// component on init (to seed from `startup_network`) and from the
+/// Wallet-tab picker `onchange` handler each time the user switches.
+pub(crate) fn set_current_network(net: Network) {
+    let lock = CURRENT_NETWORK.get_or_init(|| std::sync::RwLock::new(net));
+    *lock.write().expect("CURRENT_NETWORK RwLock poisoned") = net;
+}
+
 pub(crate) fn startup_network() -> Network {
+    // First-launch default for the implicit network used by connector
+    // RPC methods when the dApp doesn't pin one in `params`. The
+    // Wallet-tab picker is the source of truth for UI state — the user
+    // taps once to switch and the rest of the session honours that.
+    //
+    // **No platform-conditional defaults.** Previous revisions of this
+    // function had `#[cfg(target_os = "android")]` / `"ios"` arms that
+    // baked routing decisions into the binary (Tailscale on Android,
+    // localhost on iOS, PreProd on desktop). That's brittle: it makes
+    // the same APK behave differently on phone vs emulator (qemu has
+    // no Tailscale), couples a runtime choice to a build target, and
+    // breaks the moment a user wants any combination the matrix doesn't
+    // anticipate. The right layer for "which chain am I on" is the
+    // UI picker + persistence, not a cfg arm.
+    //
+    // `Undeployed` is the demo-friendly default — works for desktop dev,
+    // iOS sim (shares Mac loopback), Android emulator (via `adb reverse`),
+    // and any other host that runs the local docker chain. Real phones
+    // / mainnet-targeting users switch in the UI on first launch.
+    //
+    // `MIDNIGHT_WALLET_NETWORK` env override stays — useful for CI
+    // (set to `undeployed` for headless e2e) and per-build customisation
+    // without recompilation.
+    let fallback = Network::Undeployed;
     match std::env::var("MIDNIGHT_WALLET_NETWORK") {
         Ok(s) if !s.trim().is_empty() => match crate::bridge::parse_network(s.trim()) {
             Ok(n) => n,
             Err(e) => {
-                tracing::warn!(target: "dioxuswalletmain", error = %e, "MIDNIGHT_WALLET_NETWORK unrecognised — defaulting to PreProd");
-                Network::PreProd
+                tracing::warn!(target: "dioxuswalletmain", error = %e, "MIDNIGHT_WALLET_NETWORK unrecognised — using default");
+                fallback
             }
         },
-        _ => Network::PreProd,
+        _ => fallback,
     }
 }
 
 /// Default Vault-dApp URL when `MIDNIGHT_DAPP_URL` is unset — the
-/// Next.js dev server's default origin.
-const DEFAULT_DAPP_URL: &str = "http://localhost:3000";
-
 /// URL the embedded Vault-dApp iframe loads.
 ///
 /// The dApp is always loaded from a URL (there is no bundled export).
-/// Set `MIDNIGHT_DAPP_URL` to point the iframe at the dApp — e.g.
-/// `http://localhost:3000` for a `next dev` server, or a deployed URL.
-/// Defaults to [`DEFAULT_DAPP_URL`] when unset or blank.
-pub(crate) fn dapp_url() -> String {
-    match std::env::var("MIDNIGHT_DAPP_URL") {
-        Ok(u) if !u.trim().is_empty() => u.trim().to_string(),
-        _ => DEFAULT_DAPP_URL.to_string(),
+/// Resolution order (first match wins):
+///
+/// 1. `MIDNIGHT_DAPP_URL` env override — anything non-blank wins on any
+///    target. Used by dev rebuilds and CI to redirect the iframe at an
+///    arbitrary URL without rebuilding the binary.
+/// 2. The `dapp_url` field of the passed-in [`Network`]'s
+///    [`wallet_core::NetworkConfig`] — keeps the dApp on the same
+///    routing path as the chain endpoints, so `Undeployed` →
+///    `http://localhost:3000`, `UndeployedYurii` →
+///    `http://100.110.241.102:3000` (tailnet), production networks →
+///    their deployed dApp origins.
+///
+/// `net` must be the **runtime-selected** network (the `network`
+/// signal in `App`), not [`startup_network`] — the user can switch
+/// networks via the Wallet-tab picker at any time, and the dApp
+/// iframe `src` has to follow the picker, otherwise toggling
+/// `Undeployed → Undeployed (Tailscale)` leaves the iframe pointed
+/// at `localhost:3000` even though every chain call now goes through
+/// the tailnet.
+pub(crate) fn dapp_url(net: Network) -> String {
+    if let Ok(u) = std::env::var("MIDNIGHT_DAPP_URL") {
+        let trimmed = u.trim();
+        if !trimmed.is_empty() {
+            return trimmed.to_string();
+        }
     }
+    net.config().dapp_url.to_string()
 }
 
 /// Process-wide map of `Network → Arc<DustSyncer>`. Populated by
@@ -1114,6 +1209,10 @@ pub fn set_proof_server_url(url: String) {
     let _ = PROOF_SERVER_URL.set(url);
 }
 
+// Unused on Android — that target proves in-process via wallet-core's
+// `LocalProver` and never reads this slot. Suppress the dead-code
+// warning so the strict `#![deny(warnings)]` build still passes.
+#[cfg_attr(target_os = "android", allow(dead_code))]
 static PROOF_SERVER_URL: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 
 /// `preprod-live` only: stamp the operator's three DIDs into
@@ -1357,6 +1456,11 @@ pub fn App() -> Element {
     // WalletInfo is derived from the same network so its seed (incl. a
     // `MIDNIGHT_WALLET_SEED_HEX` override) drives the bridge loop too.
     let initial_network = startup_network();
+    // `CURRENT_NETWORK` self-initializes via `OnceLock::get_or_init`
+    // on the first `current_network()` call (using `startup_network()`
+    // as the seed), so no explicit init is needed here. Doing so
+    // explicitly from the render body would re-run on every re-render
+    // and clobber the user's picker selection back to `startup_network()`.
     let mut network = use_signal(move || initial_network);
     let mut wallet = use_signal::<Option<WalletInfo>>(move || {
         Some(WalletInfo::from_wallet(&app_wallet_for(initial_network)))
@@ -1601,18 +1705,15 @@ pub fn App() -> Element {
         let mut last_did_id = last_did_id;
         let mut last_resolved = last_resolved;
 
-        // `spawn` here is load-bearing: on Android the onclick
-        // event for the very first interactive screen (Unlock)
-        // fires on a different OS thread than the outcome pump's
-        // `use_future`. The router's `PENDING` is `thread_local!`,
-        // so a register done directly from the click body lands in
-        // the wrong slot and `take` returns `None`. Wrapping in
-        // `spawn` schedules the register + send on Dioxus' own
-        // task pool — the same pool the pump runs on — so both
-        // ends share the thread_local. See `worker/router.rs`
-        // module doc for the full invariant.
-        spawn(async move {
-            crate::worker::router::register(action_id, Box::new(move |outcome| {
+        // dispatch_action wraps the thread-affinity-critical spawn +
+        // register + send sequence so this Unlock site can never
+        // regress to a bare `register` from the WebView dispatch
+        // thread (the pre-fdba2182 bug). See `worker::dispatch_action`
+        // for the full invariant.
+        crate::worker::dispatch_action(
+            &worker,
+            action_id,
+            Box::new(move |outcome| {
             let store = match outcome {
                 crate::worker::WorkOutcome::OpenStoreOk { store, .. } => store,
                 crate::worker::WorkOutcome::Err { msg, .. } => {
@@ -1877,13 +1978,12 @@ pub fn App() -> Element {
                         }));
                     }
             }
-        }));
-
-            worker.send(crate::worker::WorkMsg::OpenStore {
+        }),
+            crate::worker::WorkMsg::OpenStore {
                 action_id,
                 passphrase: entered,
-            });
-        });
+            },
+        );
     };
 
     use_future(move || {
@@ -2139,9 +2239,12 @@ pub fn App() -> Element {
                 div { class: "dapp-host",
                     iframe {
                         style: "width:100%; height:calc(100vh - 150px); min-height:520px; border:0; border-radius:12px; background:#0b0e1a;",
-                        // The dApp is loaded from `MIDNIGHT_DAPP_URL`
-                        // (default `http://localhost:3000`); see `dapp_url`.
-                        src: dapp_url(),
+                        // `dapp_url` resolves the iframe URL from the runtime
+                        // `network` signal (NOT `startup_network`), so flipping
+                        // the picker from Undeployed → Undeployed (Tailscale)
+                        // re-renders the iframe at the tailnet origin instead
+                        // of leaving it stuck on localhost:3000.
+                        src: dapp_url(*network.read()),
                         title: "Passport Vault dApp",
                     }
                 }
@@ -2181,6 +2284,10 @@ pub fn App() -> Element {
                                 return;
                             }
                             network.set(n);
+                            // Keep the process-wide mirror in lockstep
+                            // with the picker so bridge handlers see
+                            // the new network on the very next call.
+                            set_current_network(n);
                             chain.set(ChainSnapshot::default());
                             phase.set(SyncPhase::Idle);
                             night_subunits.set(None);
